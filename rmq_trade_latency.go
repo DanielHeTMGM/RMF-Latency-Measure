@@ -183,7 +183,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	stats := NewStats(sampleSize)
+	headerStats := NewStats(sampleSize)
+	tradeTimeStats := NewStats(sampleSize)
 	ticker := time.NewTicker(reportEvery)
 	defer ticker.Stop()
 
@@ -195,12 +196,12 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			printReport(stats, parseFail, sampleSize)
+			printReport(headerStats, tradeTimeStats, parseFail, sampleSize)
 			log.Println("Exiting.")
 			return
 
 		case <-ticker.C:
-			printReport(stats, parseFail, sampleSize)
+			printReport(headerStats, tradeTimeStats, parseFail, sampleSize)
 
 		case d, ok := <-deliveries:
 			if !ok {
@@ -219,7 +220,8 @@ func main() {
 				continue
 			}
 
-			tt, err := time.ParseInLocation(rmfTimeLayout, env.Trade.TradeTime, time.UTC)
+			// Parse trade_time from body
+			tradeTime, err := time.ParseInLocation(rmfTimeLayout, env.Trade.TradeTime, time.UTC)
 			if err != nil {
 				parseFail++
 				if !autoAck {
@@ -228,24 +230,56 @@ func main() {
 				continue
 			}
 
-			latNs := consumeTs.UnixNano() - tt.UnixNano()
-			stats.Add(latNs)
+			// Extract timestamp_in_ms from headers (message creation time)
+			var headerTs time.Time
+			var hasHeaderTs bool
+			if tsMs, ok := d.Headers["timestamp_in_ms"].(int64); ok {
+				headerTs = time.Unix(0, tsMs*int64(time.Millisecond))
+				hasHeaderTs = true
+			}
+
+			// Calculate both latencies
+			tradeTimeLatNs := consumeTs.UnixNano() - tradeTime.UnixNano()
+			tradeTimeStats.Add(tradeTimeLatNs)
+
+			var headerLatNs int64
+			if hasHeaderTs {
+				headerLatNs = consumeTs.UnixNano() - headerTs.UnixNano()
+				headerStats.Add(headerLatNs)
+			}
 
 			if logEach {
-				// Print only the fields you care about + latency
+				// Print only the fields you care about + latencies
 				t := env.Trade
-				log.Printf("lat=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
-					time.Duration(latNs),
-					t.TradeTime,
-					t.CoreSymbol,
-					t.BrokerID,
-					t.IsWarehoused,
-					t.TakerLogin,
-					t.TakerExecutedPrice,
-					t.CoreOrderSide,
-					t.TakerMtOrderType,
-					t.MakerFilledVolume,
-				)
+				if hasHeaderTs {
+					log.Printf("header_lat=%s trade_time_lat=%s header_ts=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
+						time.Duration(headerLatNs),
+						time.Duration(tradeTimeLatNs),
+						headerTs.Format(rmfTimeLayout),
+						t.TradeTime,
+						t.CoreSymbol,
+						t.BrokerID,
+						t.IsWarehoused,
+						t.TakerLogin,
+						t.TakerExecutedPrice,
+						t.CoreOrderSide,
+						t.TakerMtOrderType,
+						t.MakerFilledVolume,
+					)
+				} else {
+					log.Printf("trade_time_lat=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
+						time.Duration(tradeTimeLatNs),
+						t.TradeTime,
+						t.CoreSymbol,
+						t.BrokerID,
+						t.IsWarehoused,
+						t.TakerLogin,
+						t.TakerExecutedPrice,
+						t.CoreOrderSide,
+						t.TakerMtOrderType,
+						t.MakerFilledVolume,
+					)
+				}
 			}
 
 			if !autoAck {
@@ -255,26 +289,42 @@ func main() {
 	}
 }
 
-func printReport(s *Stats, parseFail uint64, sampleSize int) {
-	count, avgNs, minNs, maxNs, lastNs, p50, p95, p99, n := s.Snapshot()
-	if count == 0 {
+func printReport(headerStats *Stats, tradeTimeStats *Stats, parseFail uint64, sampleSize int) {
+	ttCount, ttAvgNs, ttMinNs, ttMaxNs, ttLastNs, ttP50, ttP95, ttP99, ttN := tradeTimeStats.Snapshot()
+	if ttCount == 0 {
 		log.Printf("count=0 parse_fail=%d", parseFail)
 		return
 	}
+
 	log.Printf(
-		"count=%d window=%d parse_fail=%d | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
-		count, n, parseFail,
-		time.Duration(minNs),
-		time.Duration(int64(avgNs)),
-		time.Duration(p50),
-		time.Duration(p95),
-		time.Duration(p99),
-		time.Duration(maxNs),
-		time.Duration(lastNs),
+		"[TradeTime] count=%d window=%d parse_fail=%d | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
+		ttCount, ttN, parseFail,
+		time.Duration(ttMinNs),
+		time.Duration(int64(ttAvgNs)),
+		time.Duration(ttP50),
+		time.Duration(ttP95),
+		time.Duration(ttP99),
+		time.Duration(ttMaxNs),
+		time.Duration(ttLastNs),
 	)
 
+	hCount, hAvgNs, hMinNs, hMaxNs, hLastNs, hP50, hP95, hP99, hN := headerStats.Snapshot()
+	if hCount > 0 {
+		log.Printf(
+			"[HeaderTs]  count=%d window=%d              | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
+			hCount, hN,
+			time.Duration(hMinNs),
+			time.Duration(int64(hAvgNs)),
+			time.Duration(hP50),
+			time.Duration(hP95),
+			time.Duration(hP99),
+			time.Duration(hMaxNs),
+			time.Duration(hLastNs),
+		)
+	}
+
 	// Only save report if we have enough samples
-	if n < sampleSize {
+	if ttN < sampleSize {
 		return
 	}
 
@@ -282,27 +332,48 @@ func printReport(s *Stats, parseFail uint64, sampleSize int) {
 	now := time.Now().UTC()
 	ts := now.UnixNano()
 	report := struct {
-		TimestampUnixNs int64   `json:"timestamp_unix_ns"`
-		Count           uint64  `json:"count"`
-		Window          int     `json:"window"`
-		ParseFail       uint64  `json:"parse_fail"`
-		MinNs           int64   `json:"min_ns"`
-		AvgNs           float64 `json:"avg_ns"`
-		P50Ns           int64   `json:"p50_ns"`
-		P95Ns           int64   `json:"p95_ns"`
-		P99Ns           int64   `json:"p99_ns"`
-		MaxNs           int64   `json:"max_ns"`
+		TimestampUnixNs int64  `json:"timestamp_unix_ns"`
+		Count           uint64 `json:"count"`
+		ParseFail       uint64 `json:"parse_fail"`
+		TradeTime       struct {
+			Window int     `json:"window"`
+			MinNs  int64   `json:"min_ns"`
+			AvgNs  float64 `json:"avg_ns"`
+			P50Ns  int64   `json:"p50_ns"`
+			P95Ns  int64   `json:"p95_ns"`
+			P99Ns  int64   `json:"p99_ns"`
+			MaxNs  int64   `json:"max_ns"`
+		} `json:"trade_time"`
+		HeaderTs struct {
+			Window int     `json:"window"`
+			MinNs  int64   `json:"min_ns"`
+			AvgNs  float64 `json:"avg_ns"`
+			P50Ns  int64   `json:"p50_ns"`
+			P95Ns  int64   `json:"p95_ns"`
+			P99Ns  int64   `json:"p99_ns"`
+			MaxNs  int64   `json:"max_ns"`
+		} `json:"header_ts"`
 	}{
 		TimestampUnixNs: ts,
-		Count:           count,
-		Window:          n,
+		Count:           ttCount,
 		ParseFail:       parseFail,
-		MinNs:           minNs,
-		AvgNs:           avgNs,
-		P50Ns:           p50,
-		P95Ns:           p95,
-		P99Ns:           p99,
-		MaxNs:           maxNs,
+	}
+	report.TradeTime.Window = ttN
+	report.TradeTime.MinNs = ttMinNs
+	report.TradeTime.AvgNs = ttAvgNs
+	report.TradeTime.P50Ns = ttP50
+	report.TradeTime.P95Ns = ttP95
+	report.TradeTime.P99Ns = ttP99
+	report.TradeTime.MaxNs = ttMaxNs
+
+	if hCount > 0 {
+		report.HeaderTs.Window = hN
+		report.HeaderTs.MinNs = hMinNs
+		report.HeaderTs.AvgNs = hAvgNs
+		report.HeaderTs.P50Ns = hP50
+		report.HeaderTs.P95Ns = hP95
+		report.HeaderTs.P99Ns = hP99
+		report.HeaderTs.MaxNs = hMaxNs
 	}
 
 	dir := filepath.Join("data", "latency_report", now.Format("2006-01-02"))
