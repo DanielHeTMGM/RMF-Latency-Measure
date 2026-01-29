@@ -59,10 +59,11 @@ type RMFTrade struct {
 }
 
 type Stats struct {
-	Count uint64
-	SumNs float64
-	MinNs int64
-	MaxNs int64
+	Count  uint64
+	SumNs  float64
+	MinNs  int64
+	MaxNs  int64
+	LastNs int64
 
 	Samples []int64
 	Cap     int
@@ -88,6 +89,7 @@ func (s *Stats) Add(latNs int64) {
 	if latNs > s.MaxNs {
 		s.MaxNs = latNs
 	}
+	s.LastNs = latNs
 	s.Samples[s.Idx] = latNs
 	s.Idx++
 	if s.Idx >= s.Cap {
@@ -96,12 +98,12 @@ func (s *Stats) Add(latNs int64) {
 	}
 }
 
-func (s *Stats) Snapshot() (count uint64, avgNs float64, minNs, maxNs int64, p50, p95, p99 int64, n int) {
+func (s *Stats) Snapshot() (count uint64, avgNs float64, minNs, maxNs, lastNs int64, p50, p95, p99 int64, n int) {
 	count = s.Count
 	if s.Count > 0 {
 		avgNs = s.SumNs / float64(s.Count)
 	}
-	minNs, maxNs = s.MinNs, s.MaxNs
+	minNs, maxNs, lastNs = s.MinNs, s.MaxNs, s.LastNs
 
 	var window []int64
 	if s.Filled {
@@ -114,14 +116,14 @@ func (s *Stats) Snapshot() (count uint64, avgNs float64, minNs, maxNs int64, p50
 		n = s.Idx
 	}
 	if n == 0 {
-		return count, avgNs, minNs, maxNs, 0, 0, 0, 0
+		return count, avgNs, minNs, maxNs, lastNs, 0, 0, 0, 0
 	}
 
 	sort.Slice(window, func(i, j int) bool { return window[i] < window[j] })
 	p50 = percentile(window, 50)
 	p95 = percentile(window, 95)
 	p99 = percentile(window, 99)
-	return count, avgNs, minNs, maxNs, p50, p95, p99, n
+	return count, avgNs, minNs, maxNs, lastNs, p50, p95, p99, n
 }
 
 func percentile(sorted []int64, pct int) int64 {
@@ -193,12 +195,12 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			printReport(stats, parseFail)
+			printReport(stats, parseFail, sampleSize)
 			log.Println("Exiting.")
 			return
 
 		case <-ticker.C:
-			printReport(stats, parseFail)
+			printReport(stats, parseFail, sampleSize)
 
 		case d, ok := <-deliveries:
 			if !ok {
@@ -253,14 +255,14 @@ func main() {
 	}
 }
 
-func printReport(s *Stats, parseFail uint64) {
-	count, avgNs, minNs, maxNs, p50, p95, p99, n := s.Snapshot()
+func printReport(s *Stats, parseFail uint64, sampleSize int) {
+	count, avgNs, minNs, maxNs, lastNs, p50, p95, p99, n := s.Snapshot()
 	if count == 0 {
 		log.Printf("count=0 parse_fail=%d", parseFail)
 		return
 	}
 	log.Printf(
-		"count=%d window=%d parse_fail=%d | min=%s avg=%s p50=%s p95=%s p99=%s max=%s",
+		"count=%d window=%d parse_fail=%d | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
 		count, n, parseFail,
 		time.Duration(minNs),
 		time.Duration(int64(avgNs)),
@@ -268,8 +270,15 @@ func printReport(s *Stats, parseFail uint64) {
 		time.Duration(p95),
 		time.Duration(p99),
 		time.Duration(maxNs),
+		time.Duration(lastNs),
 	)
 
+	// Only save report if we have enough samples
+	if n < sampleSize {
+		return
+	}
+
+	// Save report to file
 	now := time.Now().UTC()
 	ts := now.UnixNano()
 	report := struct {

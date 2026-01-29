@@ -44,6 +44,7 @@ LOG_EACH=false
 ## Dev commands
 ```
 go run .
+go build
 go get github.com/rabbitmq/amqp091-go
 go mod tidy
 go fmt ./...
