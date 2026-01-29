@@ -169,6 +169,7 @@ func main() {
 
 	must(ch.Qos(prefetch, 0, false))
 
+	startingTime := time.Now()
 	deliveries, err := ch.Consume(
 		queue,
 		"rmf_latency_probe",
@@ -210,6 +211,13 @@ func main() {
 				return
 			}
 
+			if time.Since(startingTime) < time.Minute*5 {
+				//Skip messages received within the first 5 minutes to allow warm-up
+				if !autoAck {
+					_ = d.Ack(false)
+				}
+				continue
+			}
 			consumeTs := time.Now()
 
 			var env RMFEnvelope
