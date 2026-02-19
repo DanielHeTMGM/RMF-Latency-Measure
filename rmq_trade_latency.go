@@ -51,6 +51,9 @@ type RMFTrade struct {
 	BrokerID           string `json:"broker_id"`
 	IsWarehoused       bool   `json:"is_warehoused"`
 	TradeTime          string `json:"trade_time"`
+	TradeID            int64  `json:"trade_id"`
+	OrderID            int64  `json:"order_id"`
+	TakerName          string `json:"taker_name"`
 	TakerLogin         string `json:"taker_login"`
 	TakerExecutedPrice string `json:"taker_executed_price"`
 	CoreOrderSide      string `json:"core_order_side"`
@@ -184,13 +187,20 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	headerStats := NewStats(sampleSize)
-	tradeTimeStats := NewStats(sampleSize)
-	publishDelayStats := NewStats(sampleSize) // headerTs - tradeTime
+	// MT4 stats
+	mt4HeaderStats := NewStats(sampleSize)
+	mt4TradeTimeStats := NewStats(sampleSize)
+	mt4PublishDelayStats := NewStats(sampleSize)
+	var mt4ParseFail, mt4JSONParseFail, mt4TradeTimeParseFail uint64
+
+	// MT5 stats
+	mt5HeaderStats := NewStats(sampleSize)
+	mt5TradeTimeStats := NewStats(sampleSize)
+	mt5PublishDelayStats := NewStats(sampleSize)
+	var mt5ParseFail, mt5JSONParseFail, mt5TradeTimeParseFail uint64
+
 	ticker := time.NewTicker(reportEvery)
 	defer ticker.Stop()
-
-	var parseFail uint64
 
 	log.Printf("RMF latency probe started: queue=%s prefetch=%d autoAck=%v report_every=%s",
 		queue, prefetch, autoAck, reportEvery)
@@ -198,12 +208,14 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			printReport(headerStats, tradeTimeStats, publishDelayStats, parseFail, sampleSize)
+			printReport("MT4", mt4HeaderStats, mt4TradeTimeStats, mt4PublishDelayStats, mt4ParseFail, mt4JSONParseFail, mt4TradeTimeParseFail, sampleSize)
+			printReport("MT5", mt5HeaderStats, mt5TradeTimeStats, mt5PublishDelayStats, mt5ParseFail, mt5JSONParseFail, mt5TradeTimeParseFail, sampleSize)
 			log.Println("Exiting.")
 			return
 
 		case <-ticker.C:
-			printReport(headerStats, tradeTimeStats, publishDelayStats, parseFail, sampleSize)
+			printReport("MT4", mt4HeaderStats, mt4TradeTimeStats, mt4PublishDelayStats, mt4ParseFail, mt4JSONParseFail, mt4TradeTimeParseFail, sampleSize)
+			printReport("MT5", mt5HeaderStats, mt5TradeTimeStats, mt5PublishDelayStats, mt5ParseFail, mt5JSONParseFail, mt5TradeTimeParseFail, sampleSize)
 
 		case d, ok := <-deliveries:
 			if !ok {
@@ -211,8 +223,8 @@ func main() {
 				return
 			}
 
-			if time.Since(startingTime) < time.Minute*5 {
-				//Skip messages received within the first 5 minutes to allow warm-up
+			if time.Since(startingTime) < time.Minute*1 {
+				//Skip messages received within the first 1 minutes to allow warm-up
 				if !autoAck {
 					_ = d.Ack(false)
 				}
@@ -222,17 +234,43 @@ func main() {
 
 			var env RMFEnvelope
 			if err := json.Unmarshal(d.Body, &env); err != nil {
-				parseFail++
+				// Can't determine group without parsing, increment both
+				mt4ParseFail++
+				mt4JSONParseFail++
 				if !autoAck {
 					_ = d.Nack(false, false)
 				}
 				continue
 			}
 
+			// Determine MT4 vs MT5 group based on taker_name
+			isMT5 := strings.Contains(env.Trade.TakerName, "MT5")
+
+			// Select appropriate stats based on group
+			var headerStats, tradeTimeStats, publishDelayStats *Stats
+			var parseFail, jsonParseFail, tradeTimeParseFail *uint64
+			if isMT5 {
+				headerStats = mt5HeaderStats
+				tradeTimeStats = mt5TradeTimeStats
+				publishDelayStats = mt5PublishDelayStats
+				parseFail = &mt5ParseFail
+				jsonParseFail = &mt5JSONParseFail
+				tradeTimeParseFail = &mt5TradeTimeParseFail
+			} else {
+				headerStats = mt4HeaderStats
+				tradeTimeStats = mt4TradeTimeStats
+				publishDelayStats = mt4PublishDelayStats
+				parseFail = &mt4ParseFail
+				jsonParseFail = &mt4JSONParseFail
+				tradeTimeParseFail = &mt4TradeTimeParseFail
+			}
+			_ = jsonParseFail // suppress unused warning
+
 			// Parse trade_time from body
 			tradeTime, err := time.ParseInLocation(rmfTimeLayout, env.Trade.TradeTime, time.UTC)
 			if err != nil {
-				parseFail++
+				*parseFail++
+				*tradeTimeParseFail++
 				if !autoAck {
 					_ = d.Nack(false, false)
 				}
@@ -264,13 +302,28 @@ func main() {
 			if logEach {
 				// Print only the fields you care about + latencies
 				t := env.Trade
-				if hasHeaderTs {
-					log.Printf("header_lat=%s trade_time_lat=%s publish_delay=%s header_ts=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
-						time.Duration(headerLatNs),
-						time.Duration(tradeTimeLatNs),
-						time.Duration(publishDelayNs),
+				if hasHeaderTs && publishDelayNs > 700000000 {
+					// log.Printf("header_lat=%s trade_time_lat=%s publish_delay=%s header_ts=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
+					// 	time.Duration(headerLatNs),
+					// 	time.Duration(tradeTimeLatNs),
+					// 	time.Duration(publishDelayNs),
+					// 	headerTs.Format(rmfTimeLayout),
+					// 	t.TradeTime,
+					// 	t.CoreSymbol,
+					// 	t.BrokerID,
+					// 	t.IsWarehoused,
+					// 	t.TakerLogin,
+					// 	t.TakerExecutedPrice,
+					// 	t.CoreOrderSide,
+					// 	t.TakerMtOrderType,
+					// 	t.MakerFilledVolume,
+					// )
+
+					log.Printf("header_ts=%s trade_time=%s trade_id=%d order_id=%d core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
 						headerTs.Format(rmfTimeLayout),
 						t.TradeTime,
+						t.TradeID,
+						t.OrderID,
 						t.CoreSymbol,
 						t.BrokerID,
 						t.IsWarehoused,
@@ -281,18 +334,18 @@ func main() {
 						t.MakerFilledVolume,
 					)
 				} else {
-					log.Printf("trade_time_lat=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
-						time.Duration(tradeTimeLatNs),
-						t.TradeTime,
-						t.CoreSymbol,
-						t.BrokerID,
-						t.IsWarehoused,
-						t.TakerLogin,
-						t.TakerExecutedPrice,
-						t.CoreOrderSide,
-						t.TakerMtOrderType,
-						t.MakerFilledVolume,
-					)
+					// log.Printf("trade_time_lat=%s trade_time=%s core_symbol=%s broker_id=%s warehoused=%v taker_login=%s taker_px=%s side=%s mt_type=%s filled_vol=%s",
+					// 	time.Duration(tradeTimeLatNs),
+					// 	t.TradeTime,
+					// 	t.CoreSymbol,
+					// 	t.BrokerID,
+					// 	t.IsWarehoused,
+					// 	t.TakerLogin,
+					// 	t.TakerExecutedPrice,
+					// 	t.CoreOrderSide,
+					// 	t.TakerMtOrderType,
+					// 	t.MakerFilledVolume,
+					// )
 				}
 			}
 
@@ -303,16 +356,16 @@ func main() {
 	}
 }
 
-func printReport(headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *Stats, parseFail uint64, sampleSize int) {
+func printReport(group string, headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *Stats, parseFail uint64, jsonParseFail uint64, tradeTimeParseFail uint64, sampleSize int) {
 	ttCount, ttAvgNs, ttMinNs, ttMaxNs, ttLastNs, ttP50, ttP95, ttP99, ttN := tradeTimeStats.Snapshot()
 	if ttCount == 0 {
-		log.Printf("count=0 parse_fail=%d", parseFail)
+		log.Printf("[%s] count=0 parse_fail=%d json_fail=%d trade_time_fail=%d", group, parseFail, jsonParseFail, tradeTimeParseFail)
 		return
 	}
 
 	log.Printf(
-		"[TradeTime] count=%d window=%d parse_fail=%d | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
-		ttCount, ttN, parseFail,
+		"[%s][TradeTime] count=%d window=%d parse_fail=%d json_fail=%d trade_time_fail=%d | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
+		group, ttCount, ttN, parseFail, jsonParseFail, tradeTimeParseFail,
 		time.Duration(ttMinNs),
 		time.Duration(int64(ttAvgNs)),
 		time.Duration(ttP50),
@@ -325,8 +378,8 @@ func printReport(headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *S
 	hCount, hAvgNs, hMinNs, hMaxNs, hLastNs, hP50, hP95, hP99, hN := headerStats.Snapshot()
 	if hCount > 0 {
 		log.Printf(
-			"[HeaderTs]  count=%d window=%d              | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
-			hCount, hN,
+			"[%s][HeaderTs]  count=%d window=%d              | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
+			group, hCount, hN,
 			time.Duration(hMinNs),
 			time.Duration(int64(hAvgNs)),
 			time.Duration(hP50),
@@ -340,8 +393,8 @@ func printReport(headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *S
 	pdCount, pdAvgNs, pdMinNs, pdMaxNs, pdLastNs, pdP50, pdP95, pdP99, pdN := publishDelayStats.Snapshot()
 	if pdCount > 0 {
 		log.Printf(
-			"[PubDelay]  count=%d window=%d              | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
-			pdCount, pdN,
+			"[%s][PubDelay]  count=%d window=%d              | min=%s avg=%s p50=%s p95=%s p99=%s max=%s last=%s",
+			group, pdCount, pdN,
 			time.Duration(pdMinNs),
 			time.Duration(int64(pdAvgNs)),
 			time.Duration(pdP50),
@@ -362,8 +415,11 @@ func printReport(headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *S
 	ts := now.UnixNano()
 	report := struct {
 		TimestampUnixNs int64  `json:"timestamp_unix_ns"`
+		Group           string `json:"group"`
 		Count           uint64 `json:"count"`
 		ParseFail       uint64 `json:"parse_fail"`
+		JSONParseFail   uint64 `json:"json_parse_fail"`
+		TradeTimeFail   uint64 `json:"trade_time_parse_fail"`
 		TradeTime       struct {
 			Window int     `json:"window"`
 			MinNs  int64   `json:"min_ns"`
@@ -393,8 +449,11 @@ func printReport(headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *S
 		} `json:"publish_delay"`
 	}{
 		TimestampUnixNs: ts,
+		Group:           group,
 		Count:           ttCount,
 		ParseFail:       parseFail,
+		JSONParseFail:   jsonParseFail,
+		TradeTimeFail:   tradeTimeParseFail,
 	}
 	report.TradeTime.Window = ttN
 	report.TradeTime.MinNs = ttMinNs
@@ -424,22 +483,25 @@ func printReport(headerStats *Stats, tradeTimeStats *Stats, publishDelayStats *S
 		report.PublishDelay.MaxNs = pdMaxNs
 	}
 
-	dir := filepath.Join("data", "latency_report", now.Format("2006-01-02"))
+	// Save to group-specific directory: data/{group}/latency_report/{date}/
+	dir := filepath.Join("data", group, "latency_report", now.Format("2006-01-02"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		log.Printf("report save failed: %v", err)
+		log.Printf("[%s] report save failed: %v", group, err)
 		return
 	}
 	path := filepath.Join(dir, now.Format("150405")+".json")
 	f, err := os.Create(path)
 	if err != nil {
-		log.Printf("report save failed: %v", err)
+		log.Printf("[%s] report save failed: %v", group, err)
 		return
 	}
-	if err := json.NewEncoder(f).Encode(report); err != nil {
-		log.Printf("report save failed: %v", err)
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(report); err != nil {
+		log.Printf("[%s] report save failed: %v", group, err)
 	}
 	if err := f.Close(); err != nil {
-		log.Printf("report save failed: %v", err)
+		log.Printf("[%s] report save failed: %v", group, err)
 	}
 }
 
